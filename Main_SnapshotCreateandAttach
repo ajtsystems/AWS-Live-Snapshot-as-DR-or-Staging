@@ -1,0 +1,121 @@
+#Email Function successs
+ function Send-mailcreate{
+ param ($newvolid, $idDestination, $snapshot
+)
+ $body = "This is an automated message<br><br>"
+ $body += "<b>Volume <font color=red> $newVolID</font> has been automagically restored from snapshot $snapshot to AWS instance  <font color=red>$idDestination (DR_IDWeb4)</b></font><br><br>"
+ $body += "A Snapshot is generated every 2 hours from the Lifecycle Manager in the AWS Console here - https://console.aws.amazon.com/ec2/v2/home?region=us-east-1#Lifecycle:sort=PolicyId.<br> When this script runs, it converts the newest snapshot to a volume and attaches it to another AWS Instance, instanceID $IDDestination <br><br> "
+ $body += "You will need to start instance $idDestination in AWS.  If this is a 'real disaster', then in Route53 (DNS) repoint your domain to the new Instance."
+    Send-MailMessage -priority high -smtpserver smtp.com -to "admin@idtechex.com" -from "yourdomain@jb.com" -subject "Snapshot $snapshot has been converted to volume $newvolid and attached to AWS Instance $iddestination" -body $body -bodyAsHTML
+                         }
+
+
+#Email Function successs
+ function Send-mailfail{
+ param ($newvolid, $idDestination, $snapshot
+)
+ $body = "Something has gone wrong restoring $newvolid to $iddestination<br><br>"
+
+    Send-MailMessage -priority high -smtpserver smtp.com -to "admin@jb.com" -from "scanner1@jb.com" -subject "*FAILED to attached $newvolid from $snapshot to $iddestination*" -body $body -bodyAsHTML
+                         }
+
+#Email Function failed
+ function failed{
+ param ($instanceCheck, $snapshot
+)
+ $body = "No snapshot to restore, the latest $instanceCheck.SnapshotID is already attached as a volume from $snapshot<br><br>"
+
+    Send-MailMessage -priority high -smtpserver jb.com -to "admin@idtechex.com" -from "scanner1@jb.com" -subject "$instanceCheck + $snapshot" -body $body -bodyAsHTML
+                         }
+
+set-awscredentials -profilename jamesbennett
+
+write-host "Restoring latest snapshot ...."
+
+#EC2 Snapshot Restore
+#Source - server
+$idsource = "i-00e29f401231234"
+
+#Destination - DR2_Destination
+$idDestination = "i-050d497123123"
+
+#Make sure IDDestination is stopped otherwise you can't detach the volume
+#Stop instance with old volume
+
+#Start sounce instance if it isn't already
+#if (((Get-EC2Instance $idsource).Instances.State.Name) -ne "running") {Start-EC2Instance $idsource | Out-Null; write-host "Starting $idsource ....."}
+#Warn while instance isn't running/Stop Destination
+if (((Get-EC2Instance $idDestination).Instances.State.Name) -ne "stopped") {Stop-EC2Instance $idDestination | Out-Null; write-host "Stopping $idDestination ....."}
+
+#Get source instance volume ID
+$OldVolId = (Get-EC2Volume | ? { $_.Attachments.InstanceId -eq $idDestination}).VolumeId
+
+#Get source instance volume size and set destination instance size the same
+$OldVolSize = (Get-EC2Volume | ? { $_.Attachments.InstanceId -eq $idsource}).Size
+$NewVolSize = $OldVolSize
+
+#Get source instance availability zone
+$OrigInstanceAZ = (Get-EC2Volume | ? { $_.Attachments.InstanceId -eq $idsource}).AvailabilityZone
+
+#Get all snapshots generated but the Lifecycle snapshot DR job (Should be 3)
+$snapshots = get-ec2Snapshot | where {$_.description -contains 'Created for policy: policy-01b3ba13ce47b2dee schedule: Web04Snapshots' -and $_.status -eq 'Completed'}
+
+#Sort the snapshots from about newest first
+$snapshot = $snapshots | select name,Starttime, snapshotid | sort starttime -desc | select -first 1
+#write-host "Using $snapshot.name taken at $snapshot.startTime"
+
+#If no snapshops have been created since the last snapshot was restored, just quit the script
+$instanceCheck = Get-ec2volume | where {$_.Attachments.instanceid -eq 'i-050d4977b4a0e13f7'}
+if ($instanceCheck.SnapshotID -eq $snapshot.Snapshotid){failed $instanceCheck.SnapshotID $snapshot.Snapshotid; exit}
+
+#Create Tag for new volume
+$tag = @{ Key="DRScript1"; Value="web04" }
+$tagspec = new-object Amazon.EC2.Model.TagSpecification
+$tagspec.ResourceType = "volume"
+$tagspec.Tags.Add($tag)
+
+#Create a volume from the latest snapshot with original size, original AZ.  Store volumeID in $NewVolID
+$NewVolId = (New-EC2Volume -SnapshotId $snapshot.Snapshotid -Size $NewVolSize -AvailabilityZone $OrigInstanceAZ -VolumeType gp2 -TagSpecification $tagspec |select VolumeId |ft -HideTableHeaders | Out-String -Stream | Select-String -Pattern "vol-")
+
+
+#Dismount the old volume on the server we're using for DR
+Dismount-EC2Volume -InstanceId $idDestination -VolumeId $OldVolId -force
+Start-Sleep -s 5
+#Delete old volume (If there was one)
+if (!($oldvolid)){}
+else {
+
+while(((get-ec2volume -volumeid $oldVolID).state -eq 'available')){remove-ec2Volume -volumeid $oldVolID -force}
+     }
+
+#Make sure the volume creation from Snapshot has completed.
+#get-ec2volume | where {$_.SnapshotId -eq $snapshot.snapshotid}
+#start-sleep -seconds 5
+while((get-ec2volume | where {$_.SnapshotId -eq $snapshot.snapshotid}).status -ne 'available'){start-sleep -seconds 5; write-host "Waiting for volume...."}
+
+#Attach the new volume we created from the snapshot of our live clone
+Add-EC2Volume -InstanceId $idDestination -VolumeId $NewVolId -Device /dev/sda1
+Start-Sleep -s 60
+
+
+#Stop old instance
+#Stop-EC2Instance $idSource | Out-Null
+
+#Start instance with new volume
+#Start-EC2Instance $idDestination | Out-Null
+
+#Warn while instance isn't running
+#while (((Get-EC2Instance $idDestination).Instances.State.Name) -ne "running") {write-host "Starting instance $iddestination..."; start-sleep -seconds 5}
+
+#Send Email on successful attachment of new volume from snapshot
+$volattatchstate = Get-EC2Volume -volumeid $NewVolId
+if($volattatchstate.state -eq 'in-use'){
+    Send-mailcreate $newvolid $idDestination $snapshot.Snapshotid
+    }
+   #Send failed email if volume fails to attach
+    else {Send-mailfail}
+
+exit
+
+
+
